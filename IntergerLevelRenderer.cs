@@ -2,22 +2,37 @@ using System;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Drawing;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using ATAS.Indicators;
 using OFT.Rendering.Context;
 using OFT.Rendering.Settings;
 using OFT.Rendering.Tools;
 
-namespace Interger;
+namespace IntergerLevelRenderer;
 
-[DisplayName("Interger")]
+[DisplayName("Interger Level Renderer")]
 [Category("Custom")]
-public class Interger : Indicator
+public class IntergerLevelRenderer : Indicator
 {
+	private static readonly HttpClient ProductVersionHttpClient = new()
+	{
+		Timeout = TimeSpan.FromSeconds(5)
+	};
+
+	private const string ProductSlug = "interger-level-renderer";
+	private const string CurrentProductVersion = "1.0.2";
+	private const string ProductVersionApiUrl = "https://tradinghubs.org/api/products/latest-version";
 	private const decimal HundredStep = 100m;
 	private const decimal ThousandStep = 1000m;
 
 	private readonly RenderFont _labelFont = new RenderFont("Arial", 10f);
 
+	private volatile bool _productVersionCheckStarted;
+	private volatile bool _productUpdateAvailable;
+	private string _latestProductVersion = string.Empty;
 	private decimal _startPrice;
 	private bool _showHundredLevels = true;
 	private bool _showThousandLevels = true;
@@ -104,17 +119,19 @@ public class Interger : Indicator
 		}
 	}
 
-	public Interger()
+	public IntergerLevelRenderer()
 		: base(useCandles: true)
 	{
 		base.DenyToChangePanel = true;
 		base.EnableCustomDrawing = true;
 		base.DataSeries[0].IsHidden = true;
 		SubscribeToDrawingEvents(DrawingLayouts.Final);
+		MaybeCheckProductVersionAsync();
 	}
 
 	protected override void OnCalculate(int bar, decimal value)
 	{
+		MaybeCheckProductVersionAsync();
 	}
 
 	protected override void OnRender(RenderContext context, DrawingLayouts layout)
@@ -125,6 +142,8 @@ public class Interger : Indicator
 		IChartContainer priceContainer = base.ChartInfo.PriceChartContainer;
 		decimal low = priceContainer.Low;
 		decimal high = priceContainer.High;
+
+		DrawProductUpdateNotice(context);
 
 		if (high <= low || (!_showHundredLevels && !_showThousandLevels))
 			return;
@@ -224,6 +243,114 @@ public class Interger : Indicator
 			return false;
 
 		return (level - _startPrice) % step == 0m;
+	}
+
+	private void MaybeCheckProductVersionAsync()
+	{
+		if (_productVersionCheckStarted)
+			return;
+
+		_productVersionCheckStarted = true;
+		_ = CheckProductVersionAsync();
+	}
+
+	private async Task CheckProductVersionAsync()
+	{
+		try
+		{
+			string url = $"{ProductVersionApiUrl}?product_slug={Uri.EscapeDataString(ProductSlug)}&current_version={Uri.EscapeDataString(CurrentProductVersion)}";
+			using var response = await ProductVersionHttpClient.GetAsync(url).ConfigureAwait(false);
+			string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+			if (!response.IsSuccessStatusCode || string.IsNullOrWhiteSpace(body))
+				return;
+
+			using var doc = JsonDocument.Parse(body);
+			JsonElement root = doc.RootElement;
+			if (!TryReadString(root, "latest_version", out string latestVersion))
+				return;
+
+			bool updateAvailable = TryReadBool(root, "update_available", out bool apiUpdateAvailable)
+				? apiUpdateAvailable
+				: CompareProductVersions(latestVersion, CurrentProductVersion) != 0;
+			if (!updateAvailable)
+				return;
+
+			_latestProductVersion = latestVersion;
+			_productUpdateAvailable = true;
+			TryRedrawChart();
+		}
+		catch
+		{
+		}
+	}
+
+	private void DrawProductUpdateNotice(RenderContext context)
+	{
+		if (!_productUpdateAvailable || string.IsNullOrWhiteSpace(_latestProductVersion) || base.ChartInfo == null)
+			return;
+
+		string text = $"Interger Level Renderer {_latestProductVersion} update available / 可更新";
+		Size size = context.MeasureString(text, _labelFont);
+		context.DrawString(text, _labelFont, Color.Orange, new Rectangle(8, 8, size.Width, size.Height));
+	}
+
+	private static bool TryReadString(JsonElement root, string propertyName, out string value)
+	{
+		value = string.Empty;
+		if (!root.TryGetProperty(propertyName, out JsonElement property) || property.ValueKind != JsonValueKind.String)
+			return false;
+
+		value = property.GetString() ?? string.Empty;
+		return !string.IsNullOrWhiteSpace(value);
+	}
+
+	private static bool TryReadBool(JsonElement root, string propertyName, out bool value)
+	{
+		value = false;
+		if (!root.TryGetProperty(propertyName, out JsonElement property))
+			return false;
+
+		if (property.ValueKind == JsonValueKind.True || property.ValueKind == JsonValueKind.False)
+		{
+			value = property.GetBoolean();
+			return true;
+		}
+
+		return property.ValueKind == JsonValueKind.String && bool.TryParse(property.GetString(), out value);
+	}
+
+	private static int CompareProductVersions(string left, string right)
+	{
+		string normalizedLeft = NormalizeProductVersion(left);
+		string normalizedRight = NormalizeProductVersion(right);
+
+		if (Version.TryParse(normalizedLeft, out Version leftVersion) &&
+			Version.TryParse(normalizedRight, out Version rightVersion))
+		{
+			return leftVersion.CompareTo(rightVersion);
+		}
+
+		return string.Compare(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static string NormalizeProductVersion(string version)
+	{
+		if (string.IsNullOrWhiteSpace(version))
+			return "0.0.0";
+
+		Match match = Regex.Match(version.Trim(), @"\d+(?:\.\d+){0,3}");
+		return match.Success ? match.Value : version.Trim();
+	}
+
+	private void TryRedrawChart()
+	{
+		try
+		{
+			RedrawChart();
+		}
+		catch
+		{
+		}
 	}
 
 	private static PenSettings CreateHundredLine()
